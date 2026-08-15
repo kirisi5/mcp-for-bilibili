@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bilibili-cognitive-server"
+version = "0.1.0"
+description = "B站综合查询 MCP Server"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0.0",           # MCP 框架
+    "httpx>=0.27.0",            # 异步 HTTP 客户端
+    "pydantic>=2.5.0",          # 数据验证
+    "pydantic-settings>=2.1.0", # 环境变量管理
+    "loguru>=0.7.2",            # 日志
+    "redis>=5.0.0",             # 可选 Redis
+    "faster-whisper>=1.0.0",    # 本地语音识别（ASR）
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-httpx>=0.30.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+bili-mcp = "src.mcp.server:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
