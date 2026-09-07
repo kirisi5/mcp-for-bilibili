@@ -10,7 +10,6 @@ import tempfile
 import os
 from typing import Optional
 
-import httpx
 from src.config import settings
 from src.crawler.http_client import get_http_client
 
@@ -38,8 +37,9 @@ class AudioDownloader:
             scene="video",
         )
         data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"获取音频流失败: {data.get('message')}")
+        if not isinstance(data, dict) or data.get("code") != 0:
+            message = data.get("message", "未知错误") if isinstance(data, dict) else "响应格式无效"
+            raise RuntimeError(f"获取音频流失败: {message}")
 
         dash = data.get("data", {}).get("dash", {})
         audio_streams = dash.get("audio", [])
@@ -62,25 +62,33 @@ class AudioDownloader:
         all_urls = [url] + backup_urls
         downloaded = 0
 
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(120.0, connect=30.0),
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/",
-                     "Origin": "https://www.bilibili.com"},
-        ) as client:
-            for try_url in all_urls:
-                if not try_url:
-                    continue
+        client = self._http
+        max_bytes = settings.ASR_MAX_AUDIO_SIZE_MB * 1024 * 1024
+        for try_url in all_urls:
+            if not try_url:
+                continue
+            downloaded = 0
+            try:
+                async with client.stream("GET", try_url, scene="video") as stream_resp:
+                    if stream_resp.status_code != 200:
+                        continue
+                    with open(output_path, "wb") as f:
+                        async for chunk in stream_resp.aiter_bytes(1024 * 1024):
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                raise RuntimeError(
+                                    f"音频文件超过大小限制: {settings.ASR_MAX_AUDIO_SIZE_MB} MB"
+                                )
+                            f.write(chunk)
+                    break
+            except RuntimeError:
                 try:
-                    async with client.stream("GET", try_url) as stream_resp:
-                        if stream_resp.status_code != 200:
-                            continue
-                        with open(output_path, "wb") as f:
-                            async for chunk in stream_resp.aiter_bytes(1024 * 1024):
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                        break
-                except Exception:
-                    continue
+                    os.unlink(output_path)
+                except OSError:
+                    pass
+                raise
+            except Exception:
+                continue
 
         if downloaded == 0:
             raise RuntimeError("音频下载失败：所有 URL 均不可用")

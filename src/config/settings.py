@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_SEARCH: float = 3.0    # 搜索是风控重点
     RATE_LIMIT_COMMENT: float = 2.0   # 评论接口最敏感
     RATE_LIMIT_DANMAKU: float = 3.0
+    RATE_LIMIT_USER: float = 0.5     # 用户信息接口更容易触发风控
 
     # ── MCP Server ──
     MCP_SERVER_HOST: str = "0.0.0.0"

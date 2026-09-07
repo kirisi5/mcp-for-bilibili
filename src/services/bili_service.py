@@ -13,6 +13,7 @@ from typing import TypeVar
 
 from src.crawler.bili_client import get_bili_client
 from src.cache.cache_manager import get_cache
+from src.config import settings
 from src.models.schemas import (
     VideoMeta, VideoPage, SubtitleResult, Comment, UserInfo, MyInfo,
     SearchResult, VideoFullView, ChapterItem, InteractionInfo,
@@ -76,8 +77,12 @@ class BiliVideoService:
         if cached_value:
             return VideoMeta(**cached_value) if isinstance(cached_value, dict) else cached_value
         result = await self.client.get_video_meta(bvid)
-        await self.cache.set(cache_key, result)
+        await self.cache.set(cache_key, result, ttl=settings.CACHE_TTL_MEDIUM)
         return result
+
+    async def get_video_interaction(self, bvid: str) -> InteractionInfo:
+        meta = await self.get_video_meta(bvid)
+        return await self.client.get_interaction(bvid, meta.aid)
 
     async def get_video_pages(self, bvid: str) -> list[VideoPage]:
         cache_key = f"video:pages:{bvid}"
@@ -85,7 +90,7 @@ class BiliVideoService:
         if cached_value:
             return [VideoPage(**p) if isinstance(p, dict) else p for p in cached_value]
         result = await self.client.get_video_pages(bvid)
-        await self.cache.set(cache_key, [p.model_dump() for p in result])
+        await self.cache.set(cache_key, [p.model_dump() for p in result], ttl=settings.CACHE_TTL_MEDIUM)
         return result
 
     async def get_video_subtitle(self, bvid: str, cid: int) -> SubtitleResult | None:
@@ -100,17 +105,43 @@ class BiliVideoService:
             await self.cache.set(cache_key, "__NONE__", ttl=3600)  # 无字幕缓存 1 小时
             return None
         subtitle = SubtitleResult(subtitles=result, source="cc_subtitle")
-        await self.cache.set(cache_key, subtitle.model_dump())
+        await self.cache.set(cache_key, subtitle.model_dump(), ttl=settings.CACHE_TTL_MEDIUM)
         return subtitle
 
     async def get_video_chapters(self, bvid: str, cid: int) -> list[ChapterItem]:
-        return await self.client.get_video_chapters(bvid, cid)
+        cache_key = f"chapters:{bvid}:{cid}"
+        cached_value = await self.cache.get(cache_key)
+        if cached_value is not None:
+            return [ChapterItem(**item) for item in cached_value]
+        result = await self.client.get_video_chapters(bvid, cid)
+        await self.cache.set(cache_key, [item.model_dump() for item in result], ttl=settings.CACHE_TTL_MEDIUM)
+        return result
 
     async def get_comments(self, oid: int, page: int = 1, sort: int = 1) -> tuple[list[Comment], PageInfo]:
-        return await self.client.get_comments(oid, page=page, sort=sort)
+        cache_key = f"comments:{oid}:{page}:{sort}"
+        cached_value = await self.cache.get(cache_key)
+        if cached_value is not None:
+            return (
+                [Comment(**item) for item in cached_value["comments"]],
+                PageInfo(**cached_value["page_info"]),
+            )
+        result = await self.client.get_comments(oid, page=page, sort=sort)
+        comments, page_info = result
+        await self.cache.set(
+            cache_key,
+            {"comments": [item.model_dump() for item in comments], "page_info": page_info.model_dump()},
+            ttl=settings.CACHE_TTL_SHORT,
+        )
+        return result
 
     async def get_danmaku(self, cid: int, segment_index: int = 1) -> list[Danmaku]:
-        return await self.client.get_danmaku(cid, segment_index)
+        cache_key = f"danmaku:{cid}:{segment_index}"
+        cached_value = await self.cache.get(cache_key)
+        if cached_value is not None:
+            return [Danmaku(**item) for item in cached_value]
+        result = await self.client.get_danmaku(cid, segment_index)
+        await self.cache.set(cache_key, [item.model_dump() for item in result], ttl=settings.CACHE_TTL_SHORT)
+        return result
 
     async def get_video_full_view(self, bvid: str) -> VideoFullView:
         """
@@ -127,7 +158,7 @@ class BiliVideoService:
         subtitle_task = self._safe_fetch(lambda: self.get_video_subtitle(bvid, meta.cid))
         chapters_task = self._safe_fetch(lambda: self.get_video_chapters(bvid, meta.cid), default=[])
         comments_task = self._safe_fetch(
-            lambda: self.get_comments(meta.aid, page=1, sort=1),
+            lambda: self.get_comments(meta.aid, page=1, sort=2),
             default=([], PageInfo()),
         )
         interaction_task = self._safe_fetch(lambda: self.client.get_interaction(bvid, meta.aid))
@@ -171,7 +202,7 @@ class BiliSearchService:
         if cached_value:
             return SearchResult(**cached_value) if isinstance(cached_value, dict) else cached_value
         result = await self.client.search(keyword, page, ps)
-        await self.cache.set(cache_key, result.model_dump())
+        await self.cache.set(cache_key, result.model_dump(), ttl=settings.CACHE_TTL_MEDIUM)
         return result
 
 
@@ -185,7 +216,7 @@ class BiliUserService:
         if cached_value:
             return UserInfo(**cached_value) if isinstance(cached_value, dict) else cached_value
         result = await self.client.get_user_info(mid)
-        await self.cache.set(cache_key, result.model_dump())
+        await self.cache.set(cache_key, result.model_dump(), ttl=settings.CACHE_TTL_LONG)
         return result
 
     async def get_my_info(self) -> MyInfo:

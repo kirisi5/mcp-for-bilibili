@@ -85,6 +85,7 @@ _SCENE_RATE_MAP = {
     "search":  lambda: settings.RATE_LIMIT_SEARCH,
     "comment": lambda: settings.RATE_LIMIT_COMMENT,
     "danmaku": lambda: settings.RATE_LIMIT_DANMAKU,
+    "user":    lambda: settings.RATE_LIMIT_USER,
 }
 
 
@@ -167,7 +168,19 @@ class HTTPClientManager:
                     continue
                 raise
 
-            # 步骤2：根据状态码处理
+            # 步骤2：根据状态码和 B站业务码处理
+            business_code = None
+            if response.status_code < 400:
+                try:
+                    payload = response.json()
+                    business_code = payload.get("code") if isinstance(payload, dict) else None
+                except (ValueError, TypeError):
+                    pass
+            if business_code in (-799, -412, -429):
+                await bucket.report_ratelimited()
+                if attempt < settings.HTTP_MAX_RETRIES:
+                    await asyncio.sleep(min(2 ** (attempt + 1), 8))
+                    continue
             if response.status_code == 412:
                 await bucket.report_ratelimited()  # B站限流 → 降速
                 await asyncio.sleep(2 ** attempt)
@@ -197,6 +210,19 @@ class HTTPClientManager:
 
     async def post(self, url: str, scene: str = "default", **kwargs) -> httpx.Response:
         return await self.request("POST", url, scene=scene, **kwargs)
+
+    @asynccontextmanager
+    async def stream(self, method: str, url: str, scene: str = "default", **kwargs):
+        """通过共享连接池流式请求，并应用场景限流。"""
+        client = await self._get_client()
+        bucket = _scene_limiter.get_bucket(scene)
+        await bucket.acquire()
+        kwargs.setdefault("headers", {})
+        kwargs["headers"].setdefault("X-Trace-Id", uuid.uuid4().hex[:16])
+        async with client.stream(method, url, **kwargs) as response:
+            if response.status_code < 400:
+                await bucket.report_success()
+            yield response
 
     async def close(self):
         if self._client:

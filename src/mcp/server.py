@@ -10,7 +10,6 @@ from fastmcp import FastMCP
 
 from src.config import settings
 from src.crawler.http_client import get_http_client
-from src.crawler.bili_client import get_bili_client
 from src.services.bili_service import BiliVideoService, BiliSearchService, BiliUserService
 from src.middleware.error_handler import with_error_handler
 
@@ -112,7 +111,10 @@ async def get_video_subtitle(
 
     # 路径 1：原生字幕
     if not force_asr:
-        subtitle = await _vs().get_video_subtitle(bvid, cid)
+        try:
+            subtitle = await _vs().get_video_subtitle(bvid, cid)
+        except Exception:
+            subtitle = None
         if subtitle is not None:
             return {"bvid": bvid, "cid": cid, "source": "cc_subtitle",
                     "language": subtitle.language,
@@ -232,9 +234,7 @@ async def get_my_info() -> dict[str, object]:
           description="获取当前用户对视频的互动状态和相关推荐视频")
 @with_error_handler
 async def get_video_interaction(bvid: Annotated[str, "B站视频 BV 号"]) -> dict[str, object]:
-    meta = await _vs().get_video_meta(bvid)
-    client = get_bili_client()
-    interaction = await client.get_interaction(bvid, meta.aid)
+    interaction = await _vs().get_video_interaction(bvid)
     related = interaction.related_videos
     return {"bvid": bvid, "interaction": interaction.model_dump(),
             "related_videos": [v.model_dump() for v in related]}
@@ -272,6 +272,9 @@ async def get_video_full(
 @with_error_handler
 async def video_resource(bvid: str) -> str:
     full = await _vs().get_video_full_view(bvid)
+    if not full.has_subtitles:
+        from src.asr.transcriber import safe_asr_transcribe
+        full.subtitle = await safe_asr_transcribe(bvid, full.meta.cid)
     return json.dumps(full.model_dump(), ensure_ascii=False, indent=2, default=str)
 
 @mcp.resource(uri="bili://user/{mid}", name="B站用户数据",

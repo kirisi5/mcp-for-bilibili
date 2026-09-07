@@ -15,6 +15,7 @@ dependencies = [
     "loguru>=0.7.2",            # 日志
     "redis>=5.0.0",             # 可选 Redis
     "faster-whisper>=1.0.0",    # 本地语音识别（ASR）
+    "protobuf>=7.35.1",
 ]
 
 [project.optional-dependencies]

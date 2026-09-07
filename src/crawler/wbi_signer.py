@@ -15,8 +15,8 @@ import time
 import asyncio
 from typing import Any
 
-import httpx
 from src.config import settings
+from src.crawler.http_client import get_http_client
 
 # 映射表（来自 B站前端混淆代码，稳定不变）
 MIXIN_KEY_ENC_TAB = [
@@ -43,19 +43,19 @@ class WbiSigner:
 
     async def _fetch_keys(self) -> tuple[str, str]:
         """从 B站 nav 接口获取 img_key 和 sub_key"""
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                "https://api.bilibili.com/x/web-interface/nav",
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
-                cookies=settings.bili_cookies if settings.is_authenticated else None,
-            )
-            data = resp.json()
-            wbi_img = data["data"]["wbi_img"]
-            # wbi_img 格式: {"img_url": ".../xxx.png", "sub_url": ".../yyy.png"}
-            # 从 URL 中提取文件名作为 key
-            img_key = wbi_img["img_url"].split("/")[-1].split(".")[0]
-            sub_key = wbi_img["sub_url"].split("/")[-1].split(".")[0]
-            return img_key, sub_key
+        client = get_http_client()
+        resp = await client.get(
+            "https://api.bilibili.com/x/web-interface/nav",
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
+            scene="default",
+        )
+        data = resp.json()
+        wbi_img = data["data"]["wbi_img"]
+        # wbi_img 格式: {"img_url": ".../xxx.png", "sub_url": ".../yyy.png"}
+        # 从 URL 中提取文件名作为 key
+        img_key = wbi_img["img_url"].split("/")[-1].split(".")[0]
+        sub_key = wbi_img["sub_url"].split("/")[-1].split(".")[0]
+        return img_key, sub_key
 
     async def _ensure_mixin_key(self):
         """确保 mixin_key 有效（过期自动刷新）"""

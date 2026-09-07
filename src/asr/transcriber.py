@@ -101,8 +101,8 @@ class WhisperTranscriber:
         """带超时保护的转录（长篇视频转录可能耗时）"""
         try:
             return await asyncio.wait_for(self.transcribe(audio_path), timeout=timeout)
-        except asyncio.TimeoutError:
-            return SubtitleResult(subtitles=[], source="asr_transcription", language="zh")
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("ASR 转录超时") from exc
 
 
 _transcriber: WhisperTranscriber | None = None
@@ -127,7 +127,9 @@ async def safe_asr_transcribe(bvid: str, cid: int) -> SubtitleResult | None:
         temp_file = await downloader.download_audio(bvid, cid)
         result = await transcriber.transcribe_with_fallback(temp_file)
         return result
-    except Exception:
+    except Exception as exc:
+        from loguru import logger
+        logger.warning("ASR 转录失败(bvid=%s,cid=%s): %s", bvid, cid, exc)
         return None
     finally:
         if temp_file and os.path.exists(temp_file):

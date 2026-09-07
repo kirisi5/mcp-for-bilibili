@@ -1,74 +1,152 @@
-"""
-HTTP 客户端与限流器单元测试
+"""HTTP 客户端、签名、重试和缓存测试。"""
 
-运行方式：
-    pytest tests/test_http_client.py -v
-    pytest tests/ -v --cov=src --cov-report=term-missing
-"""
-
-import asyncio
 import time
+from unittest.mock import AsyncMock
+
+import httpx
 import pytest
-from src.crawler.http_client import RateLimitBucket
+
+from src.crawler.bili_client import BiliClient, _build_danmaku_message_class
+from src.crawler.http_client import HTTPClientManager, RateLimitBucket
+from src.services.bili_service import BiliVideoService
 
 
 class TestRateLimitBucket:
-    """令牌桶限流器测试"""
-
     async def test_basic_acquire(self):
-        """测试基本令牌获取：初始满桶应该瞬间完成"""
         bucket = RateLimitBucket(name="test", max_rate=10.0, bucket_max=10)
         start = time.monotonic()
         for _ in range(10):
             await bucket.acquire()
-        elapsed = time.monotonic() - start
-        assert elapsed < 1.0, f"初始满桶不应阻塞: {elapsed:.2f}s"
+        assert time.monotonic() - start < 1.0
 
     async def test_rate_limiting(self):
-        """测试限流效果：超配额请求应该被延迟"""
         bucket = RateLimitBucket(name="test", max_rate=5.0, bucket_max=5)
-        # 初始满桶的 5 个瞬间获取
         start = time.monotonic()
         for _ in range(5):
             await bucket.acquire()
-        instant_elapsed = time.monotonic() - start
-        assert instant_elapsed < 0.1
-
-        # 第 6 个需要等待令牌补充（速率 5/s 意味着等 ~0.2s）
         await bucket.acquire()
-        total_elapsed = time.monotonic() - start
-        assert total_elapsed > 0.1, f"第6次应受限: {total_elapsed:.3f}s"
+        assert time.monotonic() - start > 0.1
 
     async def test_rate_reduction_on_412(self):
-        """测试 412 响应触发降速"""
         bucket = RateLimitBucket(name="test", max_rate=10.0)
-        original_rate = bucket.rate
         await bucket.report_ratelimited()
-        assert bucket.rate <= original_rate / 2, f"速率应减半: {bucket.rate} vs {original_rate/2}"
+        assert bucket.rate == 5.0
 
     async def test_rate_recovery(self):
-        """测试连续成功后试探提速"""
         bucket = RateLimitBucket(name="test", max_rate=10.0)
-        bucket.rate = 5.0  # 模拟降速后的状态
+        bucket.rate = 5.0
         for _ in range(10):
             await bucket.report_success()
-        assert bucket.rate > 5.0, f"应提速: {bucket.rate} > 5.0"
-        assert bucket.rate <= 10.0, f"不超上限: {bucket.rate} <= 10.0"
+        assert 5.0 < bucket.rate <= 10.0
 
-
-# ── 以下为待实现的练习用例 ──
 
 class TestHTTPClient:
-    """HTTP 客户端集成测试（需要 mock B站 API）"""
+    async def test_signed_get_injects_wbi_params(self, monkeypatch):
+        captured = {}
 
-    async def test_signed_get_injects_wbi_params(self):
-        """练习：测试签名后的请求包含 w_rid 和 wts 参数"""
-        pass
+        class Signer:
+            async def sign_params(self, params):
+                return {**params, "wts": "123", "w_rid": "abc"}
 
-    async def test_retry_on_5xx(self):
-        """练习：测试 5xx 触发自动重试"""
-        pass
+        class Client:
+            async def get(self, url, **kwargs):
+                captured.update(kwargs)
+                return "response"
+
+        monkeypatch.setattr("src.crawler.bili_client.get_wbi_signer", lambda: Signer())
+        monkeypatch.setattr("src.crawler.bili_client.get_http_client", lambda: Client())
+        response = await BiliClient()._signed_get("https://example.test", {"bvid": "BV1"})
+
+        assert response == "response"
+        assert captured["params"]["wts"] == "123"
+        assert captured["params"]["w_rid"] == "abc"
+
+    async def test_retry_on_5xx(self, monkeypatch):
+        manager = HTTPClientManager()
+        responses = [httpx.Response(503), httpx.Response(200)]
+        calls = 0
+
+        class Client:
+            async def request(self, method, url, **kwargs):
+                nonlocal calls
+                calls += 1
+                return responses.pop(0)
+
+        monkeypatch.setattr(manager, "_get_client", AsyncMock(return_value=Client()))
+        monkeypatch.setattr("src.crawler.http_client.asyncio.sleep", AsyncMock())
+        response = await manager.get("https://example.test", scene="video")
+
+        assert response.status_code == 200
+        assert calls == 2
+
+    async def test_retry_on_bilibili_business_rate_limit(self, monkeypatch):
+        manager = HTTPClientManager()
+        responses = [
+            httpx.Response(200, json={"code": -799, "message": "请求过于频繁"}),
+            httpx.Response(200, json={"code": 0, "data": {"ok": True}}),
+        ]
+        calls = 0
+
+        class Client:
+            async def request(self, method, url, **kwargs):
+                nonlocal calls
+                calls += 1
+                return responses.pop(0)
+
+        monkeypatch.setattr(manager, "_get_client", AsyncMock(return_value=Client()))
+        monkeypatch.setattr("src.crawler.http_client.asyncio.sleep", AsyncMock())
+        response = await manager.get("https://example.test", scene="user")
+
+        assert response.json()["code"] == 0
+        assert calls == 2
 
     async def test_cache_hit_avoids_http(self):
-        """练习：测试缓存命中时跳过 HTTP 请求"""
-        pass
+        service = BiliVideoService()
+        service.cache = AsyncMock()
+        service.cache.get.return_value = {"bvid": "BV1", "title": "cached"}
+        service.client = AsyncMock()
+
+        result = await service.get_video_meta("BV1")
+
+        assert result.bvid == "BV1"
+        assert result.title == "cached"
+        service.client.get_video_meta.assert_not_awaited()
+        service.cache.set.assert_not_awaited()
+
+    async def test_interaction_degrades_when_one_endpoint_fails(self, monkeypatch):
+        client = BiliClient()
+        responses = [
+            httpx.Response(200, json={"code": -799, "message": "请求过于频繁"}),
+            httpx.Response(200, json={"code": 0, "data": [{
+                "bvid": "BV2", "aid": 2, "title": "推荐", "owner": {"name": "UP"},
+                "stat": {"view": 10, "danmaku": 1}, "rcmd_reason": "测试",
+            }]}),
+        ]
+
+        async def signed_get(*args, **kwargs):
+            return responses.pop(0)
+
+        monkeypatch.setattr(client, "_signed_get", signed_get)
+        result = await client.get_interaction("BV1", 1)
+
+        assert result.has_liked is False
+        assert len(result.related_videos) == 1
+        assert result.related_videos[0].reason == "测试"
+
+    async def test_parse_danmaku_protobuf(self):
+        reply = _build_danmaku_message_class()()
+        elem = reply.elems.add()
+        elem.content = "hello"
+        elem.progress = 1500
+        elem.fontsize = 25
+        elem.color = 16777215
+        elem.ctime = 1_700_000_000
+
+        danmakus = await BiliClient()._parse_danmaku_protobuf(reply.SerializeToString())
+
+        assert len(danmakus) == 1
+        assert danmakus[0].content == "hello"
+        assert danmakus[0].time_point == 1.5
+        assert danmakus[0].font_size == 25
+        assert danmakus[0].color == 16777215
+        assert danmakus[0].send_time is not None

@@ -43,6 +43,29 @@ def _ts_to_datetime(ts: object) -> datetime | None:
         return None
 
 
+def _build_danmaku_message_class() -> type[Any]:
+    """构造 B站 DmSegMobileReply 消息类。"""
+    from google.protobuf import descriptor_pb2, descriptor_pool
+    from google.protobuf.message_factory import GetMessageClass
+
+    file_descriptor = descriptor_pb2.FileDescriptorProto(
+        name="bilibili_dm.proto", package="bilibili.dm", syntax="proto3"
+    )
+    elem = file_descriptor.message_type.add(name="DanmakuElem")
+    for name, number, field_type in (
+        ("progress", 2, 5), ("mode", 3, 5), ("fontsize", 4, 5),
+        ("color", 5, 13), ("content", 7, 9), ("ctime", 8, 3),
+    ):
+        _ = elem.field.add(name=name, number=number, label=1, type=field_type)
+    reply = file_descriptor.message_type.add(name="DmSegMobileReply")
+    field = reply.field.add(name="elems", number=1, label=3, type=11)
+    field.type_name = ".bilibili.dm.DanmakuElem"
+
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(file_descriptor)
+    return GetMessageClass(pool.FindMessageTypeByName("bilibili.dm.DmSegMobileReply"))
+
+
 def _duration_to_seconds(value: object) -> int:
     """B站搜索接口时长格式不定（'00:12:34' 或秒数），统一转秒"""
     if isinstance(value, (int, float)):
@@ -187,10 +210,11 @@ class BiliClient:
             params={"bvid": bvid, "cid": cid},
             rate_limit="video",
         )
-        data = resp.json()["data"]
+        data = self._parse_response(resp)
 
-        subtitles = []
-        subtitle_list = data.get("subtitle", {}).get("subtitles", [])
+        subtitles: list[SubtitleItem] = []
+        subtitle_data = data.get("subtitle", {}) if isinstance(data, dict) else {}
+        subtitle_list = subtitle_data.get("subtitles", []) if isinstance(subtitle_data, dict) else []
         for sub in subtitle_list:
             sub_url = sub.get("subtitle_url", "")
             if not sub_url:
@@ -199,14 +223,22 @@ class BiliClient:
                 sub_url = "https:" + sub_url
 
             client = get_http_client()
-            sub_resp = await client.get(sub_url)
+            sub_resp = await client.get(sub_url, scene="video")
             sub_data = sub_resp.json()
-            for item in sub_data.get("body", []):
-                subtitles.append(SubtitleItem(
-                    from_time=item["from"],
-                    to_time=item["to"],
-                    content=item["content"],
-                ))
+            body = sub_data.get("body", []) if isinstance(sub_data, dict) else []
+            if not isinstance(body, list):
+                continue
+            for item in body:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    subtitles.append(SubtitleItem(
+                        from_time=float(item.get("from", 0)),
+                        to_time=float(item.get("to", 0)),
+                        content=str(item.get("content", "")),
+                    ))
+                except (TypeError, ValueError):
+                    continue
         return subtitles
 
     async def get_video_chapters(self, bvid: str, cid: int) -> list[ChapterItem]:
@@ -308,51 +340,28 @@ class BiliClient:
             rate_limit="danmaku",
         )
 
-        # 弹幕返回的是 protobuf 二进制，需要特殊处理
-        # 这里返回空列表占位，弹幕解析放到第6步单独讲
+        # 弹幕返回的是 protobuf 二进制，解析为结构化弹幕
         return await self._parse_danmaku_protobuf(resp.content)
 
     async def _parse_danmaku_protobuf(self, raw: bytes) -> list[Danmaku]:
-        """
-        解析 DmSegMobileReply protobuf
-
-        注意：B站 弹幕格式为 protobuf，需要安装 protobuf 包：
-        pip install protobuf
-
-        proto 定义简化版：
-        message DmSegMobileReply {
-            repeated DanmakuElem elems = 1;
-        }
-        message DanmakuElem {
-            int64 id = 1;       // 弹幕ID
-            int32 progress = 2; // 视频时间(ms)
-            int32 mode = 3;     // 1=滚动 4=底部 5=顶部
-            int32 fontsize = 4;
-            uint32 color = 5;
-            string content = 7; // 弹幕内容
-            int64 ctime = 8;
-            string midHash = 10;
-        }
-        """
-        # 需要引入: from google.protobuf import message
-        # 这里是伪代码占位，实际实现见第6步教学：
-        #
-        #   from google.protobuf.json_format import MessageToDict
-        #   dm_seg = DmSegMobileReply()
-        #   dm_seg.ParseFromString(raw)
-        #   danmakus = []
-        #   for elem in dm_seg.elems:
-        #       danmakus.append(Danmaku(
-        #           text=elem.content,
-        #           send_time=elem.progress / 1000.0,
-        #           mode=elem.mode,
-        #           font_size=elem.fontsize,
-        #           color=elem.color,
-        #           timestamp=elem.ctime,
-        #       ))
-        #   return danmakus
-        logger.warning("弹幕解析需要 protobuf 支持，目前返回空列表。详见第6步教学。")
-        return []
+        """解析 B站 DmSegMobileReply protobuf 弹幕响应。"""
+        proto_message = _build_danmaku_message_class()()
+        proto_message.ParseFromString(raw)
+        danmakus: list[Danmaku] = []
+        for elem in proto_message.elems:
+            content = str(elem.content)
+            if not content:
+                continue
+            danmakus.append(
+                Danmaku(
+                    content=content,
+                    time_point=float(elem.progress) / 1000.0,
+                    color=int(elem.color),
+                    font_size=int(elem.fontsize),
+                    send_time=_ts_to_datetime(elem.ctime),
+                )
+            )
+        return danmakus
 
     # ================================================================
     # 搜索
@@ -418,12 +427,12 @@ class BiliClient:
         resp = await self._signed_get(
             "https://api.bilibili.com/x/space/acc/info",
             params={"mid": mid},
-            rate_limit="video",
+            rate_limit="user",
         )
         data = self._parse_response(resp)
 
         # acc/info 不包含关注数/粉丝数，需另调 relation/stat 补充
-        following, follower = await self._get_user_stat(mid, scene="video")
+        following, follower = await self._get_user_stat(mid, scene="user")
 
         return UserInfo(
             mid=data.get("mid", mid),
@@ -456,22 +465,33 @@ class BiliClient:
         await _parse_response，但 _parse_response 是同步方法，
         不需要 await。现在直接调用 _parse_response(resp)。
         """
-        # 并行请求互动状态和推荐
-        stat_resp, related_resp = await asyncio.gather(
+        # 两个接口相互独立，任一失败时保留另一部分结果。
+        stat_result, related_result = await asyncio.gather(
             self._signed_get(
                 "https://api.bilibili.com/x/web-interface/archive/stat",
                 params={"bvid": bvid, "aid": aid},
-                rate_limit="video",
+                rate_limit="user",
             ),
             self._signed_get(
                 "https://api.bilibili.com/x/web-interface/archive/related",
                 params={"bvid": bvid},
                 rate_limit="video",
             ),
+            return_exceptions=True,
         )
-        # _parse_response 是同步方法，直接调用，不要 await
-        stat_data = self._parse_response(stat_resp)
-        related_data = self._parse_response(related_resp)
+        stat_data: dict[str, Any] = {}
+        related_data: Any = []
+        if not isinstance(stat_result, Exception):
+            try:
+                parsed = self._parse_response(stat_result)
+                stat_data = parsed if isinstance(parsed, dict) else {}
+            except Exception as exc:
+                logger.warning("获取视频互动状态失败(bvid=%s): %s", bvid, exc)
+        if not isinstance(related_result, Exception):
+            try:
+                related_data = self._parse_response(related_result)
+            except Exception as exc:
+                logger.warning("获取相关推荐失败(bvid=%s): %s", bvid, exc)
 
         related = []
         if isinstance(related_data, list):
@@ -479,11 +499,13 @@ class BiliClient:
                 related.append(RelationVideo(
                     bvid=item.get("bvid", ""), aid=item.get("aid", 0),
                     title=item.get("title", ""),
-                    author=item.get("owner", {}).get("name", ""),
+                    author=(item.get("owner") or {}).get("name", "") if isinstance(item.get("owner"), dict) else "",
                     pic=item.get("pic", ""),
-                    play=item.get("stat", {}).get("view", 0),
-                    danmaku=item.get("stat", {}).get("danmaku", 0),
-                    reason=item.get("rcmd_reason", {}).get("content", ""),
+                    play=(item.get("stat") or {}).get("view", 0) if isinstance(item.get("stat"), dict) else 0,
+                    danmaku=(item.get("stat") or {}).get("danmaku", 0) if isinstance(item.get("stat"), dict) else 0,
+                    reason=((item.get("rcmd_reason") or {}).get("content", "")
+                            if isinstance(item.get("rcmd_reason"), dict)
+                            else str(item.get("rcmd_reason") or "")),
                 ))
 
         return InteractionInfo(

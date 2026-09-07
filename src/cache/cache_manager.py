@@ -119,6 +119,7 @@ class RedisCache:
                     settings.REDIS_URL,
                     socket_connect_timeout=3,
                     socket_timeout=3,
+                    protocol=2,
                 )
                 await self._client.ping()
                 self._available = True
